@@ -223,14 +223,17 @@ public class ScheduledTaskEngine {
             log.info("Duplicate fire point {} for task {} detected and logged", fire, task.getId());
             return false;
         }
-        boolean offered = queue.size() < properties.getQueueCapacity()
-                && queue.offer(new ExecutionCmd(rec.get().getId(), task.getId(), fire, scheduledAt));
+        boolean offered = false;
+        if (queue.size() < properties.getQueueCapacity()) {
+            // 先落库 QUEUED 再入队：worker 只推进状态，任何滞后记账都不会把状态改回等待
+            if (store.markQueued(rec.get().getId(), scheduledAt)) {
+                offered = queue.offer(new ExecutionCmd(rec.get().getId(), task.getId(), fire, scheduledAt));
+            }
+        }
         if (!offered) {
             store.markSkipped(rec.get().getId(), clock.instant(), SkipReason.QUEUE_FULL);
             log.warn("Queue full (capacity={}), skipped execution {} of task {}",
                     properties.getQueueCapacity(), rec.get().getId(), task.getId());
-        } else {
-            store.markQueued(rec.get().getId(), scheduledAt);
         }
         return true;
     }
@@ -262,23 +265,28 @@ public class ScheduledTaskEngine {
             return;
         }
         ExecutionRecord rec = store.findById(cmd.executionId).orElse(null);
-        if (rec == null || rec.getStatus() == ExecutionStatus.CANCELLED
-                || rec.getStatus() == ExecutionStatus.SKIPPED) {
+        if (rec == null || rec.getStatus().isTerminal()) {
+            // 已终态（成功/失败/跳过/取消）的记录绝不再次执行
             return;
         }
         Semaphore semaphore = semaphores.computeIfAbsent(task.getId(), k -> new Semaphore(task.getMaxConcurrency()));
 
-        // 单任务并发度：获取不到则排队等待（重入延迟队列），超时则拒绝
-        boolean acquired;
-        try {
-            acquired = semaphore.tryAcquire(REQUEUE_DELAY_MS, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // 1) 全局限速预检（不消费许可）：限速不放行时不占用任务并发许可，
+        //    避免拒绝原因被错误地记为并发超限
+        if (!rateLimiter.wouldPass()) {
+            if (isWaitTimedOut(rec)) {
+                store.markSkipped(cmd.executionId, clock.instant(), SkipReason.RATE_LIMITED);
+                log.warn("Rate limit wait timed out, skipped execution {}", cmd.executionId);
+            } else {
+                requeue(cmd);
+            }
             return;
         }
+        // 2) 单任务并发度：非阻塞获取，获取不到则重入延迟队列等待，超时则拒绝。
+        //    未获取到许可时绝不 release（否则许可数膨胀会导致并发执行）
+        boolean acquired = semaphore.tryAcquire();
         if (!acquired) {
             if (isWaitTimedOut(rec)) {
-                semaphore.release();
                 store.markSkipped(cmd.executionId, clock.instant(), SkipReason.CONCURRENCY_LIMITED);
                 log.warn("Concurrency limit wait timed out for task {}, skipped execution {}",
                         task.getId(), cmd.executionId);
@@ -288,10 +296,10 @@ public class ScheduledTaskEngine {
             return;
         }
         try {
-            // 触发速率：获取不到则排队等待，超时则拒绝
+            // 3) 消费限速许可：与预检之间可能被其它 worker 抢走，失败则释放并发许可后重入队
             boolean rateOk;
             try {
-                rateOk = rateLimiter.tryAcquire(REQUEUE_DELAY_MS, TimeUnit.MILLISECONDS);
+                rateOk = rateLimiter.tryAcquire(0, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -305,7 +313,12 @@ public class ScheduledTaskEngine {
                 }
                 return;
             }
-            store.markRunning(cmd.executionId, clock.instant());
+            // 原子推进到 RUNNING：若记录已被并发地取消/置为终态，则放弃本次执行，
+            // 保证同一执行记录最多产生一次有效执行
+            if (!store.markRunning(cmd.executionId, clock.instant())) {
+                log.info("Execution {} no longer runnable (state changed concurrently), dropped", cmd.executionId);
+                return;
+            }
             runningThreads.put(cmd.executionId, Thread.currentThread());
             try {
                 task.getHandler().execute(
@@ -313,8 +326,8 @@ public class ScheduledTaskEngine {
                 if (Thread.currentThread().isInterrupted()
                         || store.findById(cmd.executionId).map(r -> r.getStatus() == ExecutionStatus.CANCELLED).orElse(false)) {
                     log.info("Execution {} was cancelled during run", cmd.executionId);
-                } else {
-                    store.markSucceeded(cmd.executionId, clock.instant());
+                } else if (!store.markSucceeded(cmd.executionId, clock.instant())) {
+                    log.info("Execution {} finished but was concurrently cancelled; keeping CANCELLED", cmd.executionId);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -353,7 +366,11 @@ public class ScheduledTaskEngine {
             return;
         }
         Instant retryAt = clock.instant().plus(policy.backoffAfter(attempt));
-        store.markRetryWait(cmd.executionId, retryAt, abbreviate(e));
+        if (!store.markRetryWait(cmd.executionId, retryAt, abbreviate(e))) {
+            // 记录已被并发地取消/置为终态：不再投递重试，避免终态被重新激活
+            log.info("Execution {} changed state concurrently, retry suppressed", cmd.executionId);
+            return;
+        }
         queue.offer(new ExecutionCmd(cmd.executionId, task.getId(), cmd.fireTime, retryAt));
         log.info("Execution {} of task {} failed (attempt {}), retry at {}",
                 cmd.executionId, task.getId(), attempt, retryAt, e);

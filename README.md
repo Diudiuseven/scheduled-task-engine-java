@@ -65,34 +65,67 @@ mvn spring-boot:run
 - `maxAttempts` 为最大执行次数（含首次），用尽后标记 `FAILED`；
 - 重试是同一条执行记录的多次尝试（`attempt` 递增），**不产生新记录**。
 
-### 2.6 去重（Deduplication）
+### 2.6 状态流转（单调、不回退）
+
+每条执行记录的状态机：
+
+```
+PENDING -> QUEUED -> RUNNING -> SUCCEEDED
+                     |   └---> RETRY_WAIT -> (重新入队) -> RUNNING
+                     |   └---> FAILED（重试用尽 / 恢复策略 FAIL）
+                     └---> SKIPPED（限流/并发/队列/补跑窗口/重叠）
+任一非终态 -> CANCELLED（取消）
+```
+
+**状态单调保证**：所有状态推进都是带前置条件的原子更新
+（`UPDATE ... WHERE id=? AND status IN (...)`），只会向前推进、绝不回退。
+即使触发登记与执行开始几乎同时发生、或多个线程并发操作同一记录：
+
+- 执行已进入 `RUNNING`/`SUCCEEDED` 后，任何滞后的排队/记账动作都无法把状态改回
+  `QUEUED`/`PENDING`，持久化结果与真实执行情况一致；
+- worker 只有在把记录从 `PENDING/QUEUED/RETRY_WAIT` 原子推进到 `RUNNING` 成功后
+  才会真正调用处理器，否则放弃本次执行 —— 同一执行记录**最多产生一次有效执行**；
+- 记录被并发取消时，执行完成后的成功记账会被拒绝，状态保持 `CANCELLED`。
+
+### 2.7 去重与拒绝原因（Deduplication & SkipReason）
 
 每个触发点唯一对应一条执行记录，唯一约束 `(task_id, fire_time)`。
-同一触发点因重试、补跑、手动补偿被重复调度时：
+同一触发点因重试、补跑、手动补偿、并发登记被重复调度时，只产生一次有效执行结果。
 
-- 只产生一次有效执行结果；
-- 重复事件写入 `duplicate_log` 表，原因 `DUPLICATE`，可追溯。
+**重复**与**其它原因拒绝**分开记录、可区分：
 
-### 2.7 重启恢复（Recovery）
+| 类别 | 记录位置 | 取值 |
+| --- | --- | --- |
+| 重复触发（该触发点已存在执行记录） | `duplicate_log` 表 | `DUPLICATE` |
+| 触发点本身被拒绝/跳过 | `execution_record.skip_reason` | `CATCHUP_WINDOW` / `OVERLAP` / `RATE_LIMITED` / `CONCURRENCY_LIMITED` / `QUEUE_FULL` / `RECOVERY_FAILED` / `CANCELLED_BY_USER` |
+
+即：查 `duplicate_log` 可回答“这个触发点被多调度了几次”，
+查 `execution_record.skip_reason` 可回答“这次执行为何没有发生”。
+
+### 2.8 重启恢复（Recovery）
 
 状态持久化在 H2 文件库，重启后区分：
 
 | 状态 | 恢复行为 |
 | --- | --- |
-| `SUCCEEDED` / `FAILED` / `SKIPPED` / `CANCELLED` | 终态，不处理 |
+| `SUCCEEDED` / `FAILED` / `SKIPPED` / `CANCELLED` | 终态，**绝不重新捡起执行** |
 | `PENDING` / `QUEUED` / `RETRY_WAIT` | 重新入队，按计划时间执行 |
 | `RUNNING` | 视为一次失败尝试：`RecoveryPolicy.RETRY`（默认，仍有重试次数则退避重试，否则 `FAILED`）或 `RecoveryPolicy.FAIL`（直接 `FAILED`） |
 
-恢复后不重复执行、不漏触发点（最近触发点由持久化记录推导）。
+恢复集合与真实在途状态一致：只有未到终态的记录进入恢复流程，
+已完成的触发点重启后不会补跑、副作用不会重复。
 
-### 2.8 限速与并发
+### 2.9 限速与并发
 
 - **全局限速**：令牌桶平滑触发速率（`engine.rate-limit`，每秒许可数，`<=0` 不限）；
 - **单任务并发度**：`TaskDefinition.maxConcurrency`（默认 1）；
-- 获取不到许可时排队等待（重入延迟队列），超过 `engine.acquire-timeout` 则拒绝，
-  记录 `SKIPPED` / `RATE_LIMITED` 或 `CONCURRENCY_LIMITED`。
+- 获取不到许可时排队等待（非阻塞重入延迟队列，worker 不会被挂起空等），
+  超过 `engine.acquire-timeout` 则拒绝，记录 `SKIPPED` / `RATE_LIMITED` 或 `CONCURRENCY_LIMITED`；
+- 先预检全局限速（不消费许可）、再占用单任务并发许可、最后消费限速许可，
+  保证拒绝原因归因准确（限速导致的拒绝不会误记为并发超限）；
+- 队列容量有界（`engine.queue-capacity`），溢出触发点记录 `SKIPPED` / `QUEUE_FULL`，不静默丢失。
 
-### 2.9 取消（Cancel）
+### 2.10 取消（Cancel）
 
 `engine.cancel(executionId)`：
 
@@ -154,4 +187,11 @@ mvn test
 - `RestartRecoveryTest`：在途执行恢复（RETRY/FAIL）、重启不重不漏；
 - `ConcurrencyTest`：限速平滑、限速拒绝、单任务并发串行化、取消执行中/排队中；
 - `QueueFullTest`：队列溢出拒绝；
+- `RaceRegressionTest`（时序回归）：
+  - 多线程并发登记同一触发点与执行同时进行 → 恰好一次有效执行，其余记 `DUPLICATE`；
+  - 触发点执行完成后重启 → 不重跑、副作用不重复，再次登记记为重复；
+  - 终态（成功/失败/取消）记录重启后不被恢复捡起；
+  - 大量任务同时到点、数量接近队列容量 → 不丢触发、不空等，全部到达终态且各执行一次；
 - `DstEngineTest` / `CronTriggerTest`：cron 与 DST 切换语义。
+
+验证方式：整套测试可连续多次全量运行（`mvn test`），应全部稳定通过。

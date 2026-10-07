@@ -39,19 +39,30 @@ public interface ExecutionStore {
 
     List<ExecutionRecord> findByTask(String taskId);
 
-    void markRunning(String id, Instant startedAt);
+    /**
+     * PENDING/QUEUED/RETRY_WAIT -&gt; RUNNING。
+     *
+     * @return true=状态推进成功；false=记录已不在可执行状态（已终态/已取消），调用方不得执行
+     */
+    boolean markRunning(String id, Instant startedAt);
 
-    void markQueued(String id, Instant at);
+    /** PENDING -&gt; QUEUED。已推进到更后阶段时返回 false，绝不回退状态。 */
+    boolean markQueued(String id, Instant at);
 
-    void markSucceeded(String id, Instant finishedAt);
+    /** RUNNING -&gt; SUCCEEDED。记录已被取消等情况下返回 false。 */
+    boolean markSucceeded(String id, Instant finishedAt);
 
-    void markRetryWait(String id, Instant nextRetryAt, String error);
+    /** RUNNING -&gt; RETRY_WAIT。 */
+    boolean markRetryWait(String id, Instant nextRetryAt, String error);
 
-    void markFailed(String id, Instant finishedAt, String error);
+    /** RUNNING/RETRY_WAIT -&gt; FAILED。 */
+    boolean markFailed(String id, Instant finishedAt, String error);
 
-    void markSkipped(String id, Instant at, SkipReason reason);
+    /** PENDING/QUEUED/RETRY_WAIT -&gt; SKIPPED。 */
+    boolean markSkipped(String id, Instant at, SkipReason reason);
 
-    void markCancelled(String id, Instant at);
+    /** 非终态 -&gt; CANCELLED。已是终态时返回 false。 */
+    boolean markCancelled(String id, Instant at);
 
     long countByStatus(ExecutionStatus status);
 
