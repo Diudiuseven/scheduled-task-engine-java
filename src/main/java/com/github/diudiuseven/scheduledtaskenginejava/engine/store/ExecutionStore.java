@@ -39,19 +39,55 @@ public interface ExecutionStore {
 
     List<ExecutionRecord> findByTask(String taskId);
 
-    void markRunning(String id, Instant startedAt);
+    /**
+     * PENDING/QUEUED/RETRY_WAIT -&gt; RUNNING。
+     *
+     * @return true=状态成功推进；false=记录已不在可执行状态（已取消/跳过/终态），调用方不得执行
+     */
+    boolean markRunning(String id, Instant startedAt);
 
-    void markQueued(String id, Instant at);
+    /**
+     * PENDING -&gt; QUEUED。仅在记录仍处于 PENDING 时生效，
+     * 不会覆盖已推进到 RUNNING/终态的记录（防止并发记账把状态改回等待）。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markQueued(String id, Instant at);
 
-    void markSucceeded(String id, Instant finishedAt);
+    /**
+     * RUNNING -&gt; SUCCEEDED。不会覆盖 CANCELLED 等并发终态。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markSucceeded(String id, Instant finishedAt);
 
-    void markRetryWait(String id, Instant nextRetryAt, String error);
+    /**
+     * RUNNING -&gt; RETRY_WAIT，attempt 自增。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markRetryWait(String id, Instant nextRetryAt, String error);
 
-    void markFailed(String id, Instant finishedAt, String error);
+    /**
+     * 任意非终态 -&gt; FAILED。已是终态的记录不受影响。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markFailed(String id, Instant finishedAt, String error);
 
-    void markSkipped(String id, Instant at, SkipReason reason);
+    /**
+     * 任意非终态 -&gt; SKIPPED。已是终态的记录不受影响。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markSkipped(String id, Instant at, SkipReason reason);
 
-    void markCancelled(String id, Instant at);
+    /**
+     * 任意非终态 -&gt; CANCELLED。已是终态的记录不受影响。
+     *
+     * @return true=状态成功推进
+     */
+    boolean markCancelled(String id, Instant at);
 
     long countByStatus(ExecutionStatus status);
 

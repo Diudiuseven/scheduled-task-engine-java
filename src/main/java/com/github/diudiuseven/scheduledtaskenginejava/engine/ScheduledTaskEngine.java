@@ -151,8 +151,8 @@ public class ScheduledTaskEngine {
             return true;
         }
         Thread worker = runningThreads.get(executionId);
-        if (worker != null) {
-            store.markCancelled(executionId, now);
+        if (worker != null && store.markCancelled(executionId, now)) {
+            // 条件取消成功才中断：若记录已并发到达终态，不打扰工作线程
             worker.interrupt();
             log.info("Cancelled running execution {}", executionId);
             return true;
@@ -223,15 +223,20 @@ public class ScheduledTaskEngine {
             log.info("Duplicate fire point {} for task {} detected and logged", fire, task.getId());
             return false;
         }
-        boolean offered = queue.size() < properties.getQueueCapacity()
-                && queue.offer(new ExecutionCmd(rec.get().getId(), task.getId(), fire, scheduledAt));
-        if (!offered) {
-            store.markSkipped(rec.get().getId(), clock.instant(), SkipReason.QUEUE_FULL);
-            log.warn("Queue full (capacity={}), skipped execution {} of task {}",
-                    properties.getQueueCapacity(), rec.get().getId(), task.getId());
-        } else {
-            store.markQueued(rec.get().getId(), scheduledAt);
+        ExecutionCmd cmd = newCmd(rec.get().getId(), task.getId(), fire, scheduledAt);
+        // 容量检查与入队在同一临界区内，避免并发登记同时越过容量上限
+        synchronized (queue) {
+            if (queue.size() >= properties.getQueueCapacity()) {
+                store.markSkipped(rec.get().getId(), clock.instant(), SkipReason.QUEUE_FULL);
+                log.warn("Queue full (capacity={}), skipped execution {} of task {}",
+                        properties.getQueueCapacity(), rec.get().getId(), task.getId());
+                return true;
+            }
+            queue.offer(cmd);
         }
+        // 条件推进 PENDING -> QUEUED：若 worker 已抢先执行完毕或记录被并发取消，
+        // 此处不再生效，状态保持单调不回退
+        store.markQueued(rec.get().getId(), scheduledAt);
         return true;
     }
 
@@ -262,8 +267,8 @@ public class ScheduledTaskEngine {
             return;
         }
         ExecutionRecord rec = store.findById(cmd.executionId).orElse(null);
-        if (rec == null || rec.getStatus() == ExecutionStatus.CANCELLED
-                || rec.getStatus() == ExecutionStatus.SKIPPED) {
+        if (rec == null || rec.getStatus().isTerminal()) {
+            // 已终态（成功/失败/跳过/取消）的记录不再执行，重复队列元素直接丢弃
             return;
         }
         Semaphore semaphore = semaphores.computeIfAbsent(task.getId(), k -> new Semaphore(task.getMaxConcurrency()));
@@ -278,7 +283,6 @@ public class ScheduledTaskEngine {
         }
         if (!acquired) {
             if (isWaitTimedOut(rec)) {
-                semaphore.release();
                 store.markSkipped(cmd.executionId, clock.instant(), SkipReason.CONCURRENCY_LIMITED);
                 log.warn("Concurrency limit wait timed out for task {}, skipped execution {}",
                         task.getId(), cmd.executionId);
@@ -305,16 +309,24 @@ public class ScheduledTaskEngine {
                 }
                 return;
             }
-            store.markRunning(cmd.executionId, clock.instant());
+            // 进入 RUNNING 是执行的准入闸门：条件更新失败说明记录已被并发地
+            // 取消/跳过/完成，直接放弃，保证同一执行记录最多一次有效执行。
+            if (!store.markRunning(cmd.executionId, clock.instant())) {
+                log.info("Execution {} no longer runnable (concurrent state change), dropped",
+                        cmd.executionId);
+                return;
+            }
             runningThreads.put(cmd.executionId, Thread.currentThread());
             try {
                 task.getHandler().execute(
                         new ExecutionContext(task.getId(), cmd.executionId, cmd.fireTime, rec.getAttempt()));
-                if (Thread.currentThread().isInterrupted()
-                        || store.findById(cmd.executionId).map(r -> r.getStatus() == ExecutionStatus.CANCELLED).orElse(false)) {
-                    log.info("Execution {} was cancelled during run", cmd.executionId);
-                } else {
-                    store.markSucceeded(cmd.executionId, clock.instant());
+                if (Thread.currentThread().isInterrupted()) {
+                    // 运行期间被中断（取消或引擎关闭）：状态由取消方/恢复流程决定
+                    log.info("Execution {} interrupted during run, state left to canceller/recovery",
+                            cmd.executionId);
+                } else if (!store.markSucceeded(cmd.executionId, clock.instant())) {
+                    // 并发取消先落库：CANCELLED 不被覆盖
+                    log.info("Execution {} completed but was concurrently cancelled", cmd.executionId);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -338,9 +350,16 @@ public class ScheduledTaskEngine {
         return clock.instant().isAfter(rec.getCreatedAt().plus(properties.getAcquireTimeout()));
     }
 
+    /** 构造队列元素：按引擎时钟计算剩余延迟，并换算为 wall-clock 到期时刻。 */
+    private ExecutionCmd newCmd(String executionId, String taskId, Instant fireTime, Instant scheduledAt) {
+        long delayMs = Math.max(0, scheduledAt.toEpochMilli() - clock.instant().toEpochMilli());
+        return new ExecutionCmd(executionId, taskId, fireTime, scheduledAt,
+                System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs));
+    }
+
     private void requeue(ExecutionCmd cmd) {
         Instant next = clock.instant().plusMillis(REQUEUE_DELAY_MS);
-        queue.offer(new ExecutionCmd(cmd.executionId, cmd.taskId, cmd.fireTime, next));
+        queue.offer(newCmd(cmd.executionId, cmd.taskId, cmd.fireTime, next));
     }
 
     private void handleFailure(TaskDefinition task, ExecutionCmd cmd, ExecutionRecord rec, Exception e) {
@@ -353,10 +372,15 @@ public class ScheduledTaskEngine {
             return;
         }
         Instant retryAt = clock.instant().plus(policy.backoffAfter(attempt));
-        store.markRetryWait(cmd.executionId, retryAt, abbreviate(e));
-        queue.offer(new ExecutionCmd(cmd.executionId, task.getId(), cmd.fireTime, retryAt));
-        log.info("Execution {} of task {} failed (attempt {}), retry at {}",
-                cmd.executionId, task.getId(), attempt, retryAt, e);
+        if (store.markRetryWait(cmd.executionId, retryAt, abbreviate(e))) {
+            queue.offer(newCmd(cmd.executionId, task.getId(), cmd.fireTime, retryAt));
+            log.info("Execution {} of task {} failed (attempt {}), retry at {}",
+                    cmd.executionId, task.getId(), attempt, retryAt, e);
+        } else {
+            // 并发取消/关闭已推进状态：不再安排重试，避免复活终态记录
+            log.info("Execution {} of task {} failed but state already changed; no retry enqueued",
+                    cmd.executionId, task.getId());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -382,13 +406,13 @@ public class ScheduledTaskEngine {
                 } else {
                     Instant retryAt = clock.instant().plus(task.getRetryPolicy().backoffAfter(attempt));
                     store.markRetryWait(rec.getId(), retryAt, "interrupted by restart");
-                    queue.offer(new ExecutionCmd(rec.getId(), task.getId(), rec.getFireTime(), retryAt));
+                    queue.offer(newCmd(rec.getId(), task.getId(), rec.getFireTime(), retryAt));
                     log.info("Recovered RUNNING execution {} -> RETRY_WAIT at {}", rec.getId(), retryAt);
                 }
             }
             case PENDING, QUEUED, RETRY_WAIT -> {
                 Instant scheduledAt = rec.getNextRetryAt() != null ? rec.getNextRetryAt() : clock.instant();
-                queue.offer(new ExecutionCmd(rec.getId(), task.getId(), rec.getFireTime(), scheduledAt));
+                queue.offer(newCmd(rec.getId(), task.getId(), rec.getFireTime(), scheduledAt));
                 log.info("Recovered {} execution {} -> requeued at {}", rec.getStatus(), rec.getId(), scheduledAt);
             }
             default -> {
@@ -406,14 +430,15 @@ public class ScheduledTaskEngine {
     // 队列元素
     // ------------------------------------------------------------------
 
-    /** 延迟队列元素：携带执行 id、任务 id 与触发时刻。 */
+    /** 延迟队列元素：携带执行 id、任务 id 与触发时刻。
+     *  到期时刻在构造时按引擎时钟换算为 wall-clock 纳秒，
+     *  保证延迟语义与调度时钟一致，不受时钟基准差异影响。 */
     public record ExecutionCmd(String executionId, String taskId, Instant fireTime,
-                               Instant scheduledAt) implements Delayed {
+                               Instant scheduledAt, long dueAtNanos) implements Delayed {
 
         @Override
         public long getDelay(TimeUnit unit) {
-            long delayMs = scheduledAt.toEpochMilli() - System.currentTimeMillis();
-            return unit.convert(delayMs, TimeUnit.MILLISECONDS);
+            return unit.convert(dueAtNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
         }
 
         @Override

@@ -73,6 +73,13 @@ mvn spring-boot:run
 - 只产生一次有效执行结果；
 - 重复事件写入 `duplicate_log` 表，原因 `DUPLICATE`，可追溯。
 
+**重复与拒绝的区分**：重复触发不改变既有执行记录，只在 `duplicate_log`
+追加一条事件（`reason = DUPLICATE`，含检出时间）；而被拒绝的触发点会在
+`execution_record` 中留下一条 `SKIPPED` 终态记录，`skip_reason` 标明具体原因
+（`CATCHUP_WINDOW` / `OVERLAP` / `RATE_LIMITED` / `CONCURRENCY_LIMITED` /
+`QUEUE_FULL`）。换言之：查“同一个触发点被调度了几次”看 `duplicate_log`，
+查“某个触发点为什么没执行”看 `execution_record.skip_reason`。
+
 ### 2.7 重启恢复（Recovery）
 
 状态持久化在 H2 文件库，重启后区分：
@@ -99,6 +106,39 @@ mvn spring-boot:run
 - 排队中：移出队列并标记 `CANCELLED`；
 - 执行中：中断工作线程，处理器应响应中断并尽快退出（建议保证幂等性）；
 - 取消后不留下半完成状态，状态一致落库。
+
+### 2.10 状态流转规则（单调推进）
+
+一次触发从登记到落库的全过程中，状态只允许按下表**单调推进**，任何并发的
+排队/记账动作都不得把状态改回等待态：
+
+| 当前状态 | 允许推进到 | 触发动作 |
+| --- | --- | --- |
+| `PENDING` | `QUEUED`、`RUNNING`、`RETRY_WAIT`、`SKIPPED`、`CANCELLED`、`FAILED` | 入队 / 恢复重入队 / 恢复重试 / 超限拒绝 / 取消 |
+| `QUEUED` | `RUNNING`、`SKIPPED`、`CANCELLED`、`FAILED` | 开始执行 / 等待超时拒绝 / 取消 |
+| `RETRY_WAIT` | `RUNNING`、`CANCELLED`、`FAILED` | 到点重试 / 取消 |
+| `RUNNING` | `SUCCEEDED`、`RETRY_WAIT`、`FAILED`、`CANCELLED` | 完成 / 失败重试 / 失败终态 / 取消 |
+| `SUCCEEDED` / `FAILED` / `SKIPPED` / `CANCELLED` | —（终态，不可再变） | — |
+
+实现上，持久层的每一次状态变更都是**带前置状态守卫的条件更新**
+（`UPDATE ... WHERE id = ? AND status IN (...)`）：
+
+- 执行一旦进入 `RUNNING`/`SUCCEEDED`/`FAILED`/`CANCELLED`，滞后的
+  `markQueued` 等记账动作不再生效，持久化结果与真实执行情况一致，
+  重启后不会被当作未完成而补跑；
+- `markRunning` 是执行的准入闸门：条件更新失败（记录已被并发取消/跳过/完成）
+  时直接放弃执行，保证同一执行记录最多一次有效执行；
+- 取消与完成并发时，先落库者获胜，另一方自动放弃，不会出现
+  `CANCELLED` 被覆盖回 `SUCCEEDED` 或反之的半完成状态。
+
+### 2.11 并发与容量边界
+
+- 队列容量的“检查 + 入队”在同一临界区完成，多线程同时登记不会越过容量上限；
+  超限触发点立即落库 `SKIPPED` / `QUEUE_FULL`，不丢失、可追踪；
+- 单任务并发许可严格成对获取/释放，等待超时只拒绝该次执行
+  （`SKIPPED` / `CONCURRENCY_LIMITED`），不会泄漏许可导致后续重叠执行；
+- 延迟队列的到期时刻按引擎时钟计算并换算为 wall-clock，重试/重入队延迟
+  不受时钟基准差异影响，引擎不会因记账顺序问题长时间空等。
 
 ## 3. 配置项（application.properties）
 
@@ -154,4 +194,25 @@ mvn test
 - `RestartRecoveryTest`：在途执行恢复（RETRY/FAIL）、重启不重不漏；
 - `ConcurrencyTest`：限速平滑、限速拒绝、单任务并发串行化、取消执行中/排队中；
 - `QueueFullTest`：队列溢出拒绝；
+- `StateMonotonicityTest`：状态单调性回归 —— 终态不被并发记账覆盖、
+  并发登记与执行同时进行时完成记录保持 `SUCCEEDED`、同一触发点并发调度
+  仅一次有效执行且重复事件落库、已完成触发点重启后不重跑、
+  终态记录不进入恢复流程；
+- `EngineBoundaryTest`：边界行为回归 —— 队列容量上限下并发登记不丢触发、
+  超限拒绝并记录 `QUEUE_FULL`、触发与执行几乎同时发生时单任务不重叠、
+  被跳过触发点各自留下 `CONCURRENCY_LIMITED` 记录、限流突发下全部触发
+  在预算内完成不空等；
 - `DstEngineTest` / `CronTriggerTest`：cron 与 DST 切换语义。
+
+### 验证方法
+
+1. `mvn test` 全量运行，连续多次均应稳定通过（已验证连续 3 次全绿）；
+2. 状态单调性：任意时刻查询
+   `SELECT status, COUNT(*) FROM execution_record GROUP BY status`，
+   已完成的触发点（handler 已产生副作用）应对应 `SUCCEEDED`，
+   不存在“执行完成但记录停留在 `PENDING`/`QUEUED`”的记录；
+3. 重复与拒绝区分：重复触发查 `duplicate_log`（`reason = DUPLICATE`），
+   被拒绝的触发点查 `execution_record` 中 `status = 'SKIPPED'` 的
+   `skip_reason` 列；
+4. 重启恢复：重启后 `findRecoverable` 只返回非终态记录，终态记录
+   不会被重新执行（`StateMonotonicityTest` 中对应用例覆盖）。

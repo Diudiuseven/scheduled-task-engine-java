@@ -91,7 +91,8 @@ public class JdbcExecutionStore implements ExecutionStore {
     @Override
     public Optional<ExecutionRecord> insertPending(String taskId, Instant fireTime, Instant scheduledAt, int maxAttempts) {
         String id = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        // createdAt 与 scheduledAt 同源（引擎时钟），保证等待超时等判断时钟基准一致
+        Instant now = scheduledAt;
         try {
             jdbc.update("""
                     INSERT INTO execution_record
@@ -197,54 +198,69 @@ public class JdbcExecutionStore implements ExecutionStore {
         return list.isEmpty() ? Optional.empty() : Optional.of(list.get(0));
     }
 
+    /**
+     * 状态单调推进：所有状态变更都带前置状态守卫，已进入终态
+     * （SUCCEEDED/FAILED/SKIPPED/CANCELLED）的记录不会被任何并发记账动作改回。
+     */
+    private static final String NON_TERMINAL_GUARD =
+            "status IN ('PENDING', 'QUEUED', 'RUNNING', 'RETRY_WAIT')";
+
     @Override
-    public void markRunning(String id, Instant startedAt) {
-        jdbc.update("UPDATE execution_record SET status = 'RUNNING', started_at = ? WHERE id = ?",
-                writeInstant(startedAt), id);
+    public boolean markRunning(String id, Instant startedAt) {
+        return jdbc.update("""
+                UPDATE execution_record SET status = 'RUNNING', started_at = ?
+                WHERE id = ? AND status IN ('PENDING', 'QUEUED', 'RETRY_WAIT')
+                """, writeInstant(startedAt), id) > 0;
     }
 
     @Override
-    public void markQueued(String id, Instant at) {
-        jdbc.update("UPDATE execution_record SET status = 'QUEUED', scheduled_at = ? WHERE id = ?",
-                writeInstant(at), id);
+    public boolean markQueued(String id, Instant at) {
+        return jdbc.update("""
+                UPDATE execution_record SET status = 'QUEUED', scheduled_at = ?
+                WHERE id = ? AND status = 'PENDING'
+                """, writeInstant(at), id) > 0;
     }
 
     @Override
-    public void markSucceeded(String id, Instant finishedAt) {
-        jdbc.update("UPDATE execution_record SET status = 'SUCCEEDED', finished_at = ? WHERE id = ?",
-                writeInstant(finishedAt), id);
+    public boolean markSucceeded(String id, Instant finishedAt) {
+        return jdbc.update("""
+                UPDATE execution_record SET status = 'SUCCEEDED', finished_at = ?
+                WHERE id = ? AND status = 'RUNNING'
+                """, writeInstant(finishedAt), id) > 0;
     }
 
     @Override
-    public void markRetryWait(String id, Instant nextRetryAt, String error) {
-        jdbc.update("""
+    public boolean markRetryWait(String id, Instant nextRetryAt, String error) {
+        return jdbc.update("""
                 UPDATE execution_record
                 SET status = 'RETRY_WAIT', attempt = attempt + 1, next_retry_at = ?, last_error = ?
-                WHERE id = ?
-                """, writeInstant(nextRetryAt), truncate(error), id);
+                WHERE id = ? AND status = 'RUNNING'
+                """, writeInstant(nextRetryAt), truncate(error), id) > 0;
     }
 
     @Override
-    public void markFailed(String id, Instant finishedAt, String error) {
-        jdbc.update("""
+    public boolean markFailed(String id, Instant finishedAt, String error) {
+        return jdbc.update("""
                 UPDATE execution_record
                 SET status = 'FAILED', attempt = attempt + 1, finished_at = ?, last_error = ?
-                WHERE id = ?
-                """, writeInstant(finishedAt), truncate(error), id);
+                WHERE id = ? AND\s""" + NON_TERMINAL_GUARD,
+                writeInstant(finishedAt), truncate(error), id) > 0;
     }
 
     @Override
-    public void markSkipped(String id, Instant at, SkipReason reason) {
-        jdbc.update("""
+    public boolean markSkipped(String id, Instant at, SkipReason reason) {
+        return jdbc.update("""
                 UPDATE execution_record SET status = 'SKIPPED', finished_at = ?, skip_reason = ?
-                WHERE id = ?
-                """, writeInstant(at), reason.name(), id);
+                WHERE id = ? AND\s""" + NON_TERMINAL_GUARD,
+                writeInstant(at), reason.name(), id) > 0;
     }
 
     @Override
-    public void markCancelled(String id, Instant at) {
-        jdbc.update("UPDATE execution_record SET status = 'CANCELLED', finished_at = ? WHERE id = ?",
-                writeInstant(at), id);
+    public boolean markCancelled(String id, Instant at) {
+        return jdbc.update("""
+                UPDATE execution_record SET status = 'CANCELLED', finished_at = ?
+                WHERE id = ? AND\s""" + NON_TERMINAL_GUARD,
+                writeInstant(at), id) > 0;
     }
 
     @Override
